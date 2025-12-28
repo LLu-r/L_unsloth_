@@ -134,7 +134,7 @@ Unsloth 为了优化性能，会对模型做 monkey-patch（运行时修改方�
 
 &nbsp;
 
-修改后的内容如下：
+修改的内容如下：
 
 predict(test_dataset):
        
@@ -175,14 +175,14 @@ Unsloth 主要优化这些方面：
 
 #### KL散度(Kullback-Leibler divergence)
 
-KL散度是机器学习中常用的指标之一，它常用于衡量两个分布之间的差异。衡量当我们使用一个近似概率分布 Q 来建模或描述一个真实概率分布 P 时的信息损失
+KL散度常用于衡量两个分布之间的差异。衡量当我们使用一个近似概率分布 Q 来建模或描述一个真实概率分布 P 时的信息损失。
 
 
  在机器学习中x通常是离散变量,分布 Q(X)与 P(X) 的KL散度计算公式为：
 
- $
+ $$
  KL(P||Q) = \sum_{x∈X}P(x)ln[P(x)/Q(x)]
- $
+ $$
 
 根据公式也不难看出：当KL散度越小，意味着分布 Q 对分布 P 的拟合程度越高(损失越小)。
 
@@ -190,15 +190,15 @@ KL散度是机器学习中常用的指标之一，它常用于衡量两个分布
 
 1. 监控变量分布
 
-模型一般是基于历史样本训练的，所以随着时间推移，可能不适用于线上数据。此时，可以使用KL散度来监控线上变量的分布是否与建模时的训练数据的分布一致。当KL散度大于一定阈值时，就自动发警报，方便建模人员进行分析与采取相关措施
+模型一般是基于历史样本训练的，所以随着时间推移，可能不适用于当前数据。此时，可以使用KL散度来监控线上变量的分布是否与建模时的训练数据的分布一致。当KL散度大于一定阈值时，就自动发警报，方便建模人员进行分析与采取相关措施。
 
-2. 作为损失函数的正则项
+2. **作为损失函数的正则项**
 
 在训练模型的时候，可以用KL散度作为正则项，强制使模型的预测值趋向目标分布。使用KL散度作为正则项，可以抵抗过拟合，它可以使模型预测值的分布更加合理化  
 
-#### R-Drop原理分析
+#### R-Drop分析
 
-R-Drop 是一种基于 Dropout 的正则化方法，用于深度神经网络的训练。Dropout 通过随机丢弃神经元来防止过拟合。而R-Drop 通过强制不同子模型的输出分布一致性来进一步增强 Dropout 的效果。
+R-Drop 是一种基于 Dropout 的正则化方法。Dropout 通过随机丢弃神经元来防止过拟合。而R-Drop 通过强制不同子模型的输出分布一致性来进一步增强 Dropout 的效果。
 
 ##### Dropout的问题：
 
@@ -221,4 +221,192 @@ L_total = L_nll + α × L_kl 其中 α 为超参数，控制一致性约束的�
 
 ![r-drop1](images/r-drop1.png)
 
+##### imdb_bert_rdrop中实现：
 
+```python
+def forward(self, input_ids=None, attention_mask=None, token_type_ids=None, labels=None):
+    # ========== 第一次前向传播 ==========
+    outputs = self.bert(input_ids, attention_mask, token_type_ids)
+    pooled_output = outputs[1]
+    pooled_output = self.dropout(pooled_output)  # ← dropout 随机丢弃一些神经元
+    logits = self.classifier(pooled_output)
+
+    # ========== 第二次前向传播（同样的输入！）==========
+    kl_outputs = self.bert(input_ids, attention_mask, token_type_ids)
+    kl_output = kl_outputs[1]
+    kl_output = self.dropout(kl_output)  # ← 同一个 dropout，但随机 mask 不同！
+    kl_logits = self.classifier(kl_output)
+
+    # ========== 计算损失 ==========
+    if labels is not None:
+        loss_fct = nn.CrossEntropyLoss()
+        loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))      # CE loss 1
+        ce_loss = loss_fct(kl_logits.view(-1, self.num_labels), labels.view(-1)) # CE loss 2
+        
+        # ========== R-Drop 的核心：KL 散度正则 ==========
+        kl_loss = (KL(logits, kl_logits) + KL(kl_logits, logits)) / 2.
+        
+        total_loss = loss + ce_loss + kl_loss
+```
+
+为什么用双向 KL？
+
+```python
+kl_loss = (KL(P₁ || P₂) + KL(P₂ || P₁)) / 2
+```
+
+因为 KL 散度不对称：KL(P||Q) ≠ KL(Q||P)
+
+双向 KL 保证：
+P₁ 要接近 P₂,P₂ 也要接近 P₁
+
+&nbsp;
+
+### Supervised Contrastive Learning(监督对比学习)
+
+论文：https://arxiv.org/abs/2004.11362
+
+#### 对比学习
+
+简单来说，对比学习不直接学习 “样本的标签是什么”，而学习 “样本之间的相似关系”—— 通过构建 **正负样本对** ，让模型学会分辨 “哪些样本是同类、哪些是异类”，最终得到的特征既能保留样本的核心语义。
+
+对比学习的本质是 “在特征空间中拉近相似样本、推开不相似样本”。用真实标签替代数据增强来定义 “相似” 与 “不相似”，大幅提升特征的判别能力。
+
+&nbsp;
+
+#### 监督对比学习
+
+**直接利用样本的类别标签定义正负样本：**
+
+正样本：同一标签的所有样本（无论是否经过数据增强）
+
+负样本：不同标签的所有样本
+
+这种方式更精准地对齐任务目标，在下游任务（如分类）上的特征迁移效果远超无监督对比学习。
+
+##### SupCon（监督）:
+
+  猫图片1 → 表示1 ─┐
+  
+  猫图片2 → 表示2 ─┼─ 这些都要接近（同类）
+  
+  猫图片3 → 表示3 ─┘
+
+  狗图片1 → 表示4 ─┐
+  
+  狗图片2 → 表示5 ─┼─ 这些要远离猫的表示（异类）
+
+
+##### 对比损失函数
+
+batch 中的样本 i，损失为：
+
+$L_i = -\frac{1}{|P(i)|} \times \sum_{p \in P(i)} \log\left[ \frac{\exp(z_i \cdot z_p / \tau)}{\sum_{a \neq i} \exp(z_i \cdot z_a / \tau)} \right]$
+
+1. z_i = 样本 i 的归一化表示向量
+
+2. P(i) = 与样本 i 同类的所有样本集合（正样本）
+
+3. τ = 温度参数（控制分布的平滑程度）
+   
+4. 分母是所有非自身样本的相似度之和
+
+##### 举例说明：
+
+**样本与表示对应关系**
+
+样本: &nbsp;&nbsp; $\boldsymbol{●_1}$ &nbsp;&nbsp; $\boldsymbol{●_2}$ &nbsp;&nbsp; $\boldsymbol{●_3}$ &nbsp;&nbsp; $\boldsymbol{○_1}$ &nbsp;&nbsp; $\boldsymbol{○_2}$ &nbsp;&nbsp; $\boldsymbol{○_3}$
+
+表示: &nbsp;&nbsp; $\boldsymbol{z_1}$ &nbsp;&nbsp; $\boldsymbol{z_2}$ &nbsp;&nbsp; $\boldsymbol{z_3}$ &nbsp;&nbsp; $\boldsymbol{z_4}$ &nbsp;&nbsp; $\boldsymbol{z_5}$ &nbsp;&nbsp; $\boldsymbol{z_6}$
+
+**针对 $\boldsymbol{●_1}$ 的正负样本划分**
+- 正样本（同类）: $\boldsymbol{●_2,\ ●_3}$
+- 负样本（异类）: $\boldsymbol{○_1,\ ○_2,\ ○_3}$
+
+**$\boldsymbol{Loss_1}$ 计算项**
+
+$$
+\log \frac{\exp(z_1 \cdot z_2 / \tau)}{\exp(z_1 \cdot z_2 / \tau) + \exp(z_1 \cdot z_3 / \tau) + \exp(z_1 \cdot z_4 / \tau) + \exp(z_1 \cdot z_5 / \tau) + \exp(z_1 \cdot z_6 / \tau)}
+$$
+
+> 分母中 $\boldsymbol{\exp(z_1 \cdot z_4 / \tau) + \exp(z_1 \cdot z_5 / \tau) + \exp(z_1 \cdot z_6 / \tau)}$ 对应负样本项，**要让它们的整体值更小**
+
+&nbsp;
+
+&nbsp;
+
+##### imdb_bert_scl_trainer.py 和 loss.py中的scl
+
+imdb_bert_scl_trainer.py 中 SCL 体现在 forward() 函数的这部分
+
+```python
+def forward(self, input_ids=None, attention_mask=None, token_type_ids=None, labels=None):
+    outputs = self.bert(input_ids, attention_mask, token_type_ids)
+    pooled_output = outputs[1]  # [CLS] 的表示向量
+    pooled_output = self.dropout(pooled_output)
+    logits = self.classifier(pooled_output)
+
+    loss = None
+    if labels is not None:
+        # 1. 普通的交叉熵损失
+        loss_fct = nn.CrossEntropyLoss()
+        ce_loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+
+        # 2. 监督对比学习损失 ← SCL 在这里！
+        scl_fct = losses.SupConLoss()
+        scl_loss = scl_fct(pooled_output, labels)
+
+        # 3. 组合损失
+        loss = ce_loss + self.alpha * scl_loss  # alpha = 0.2
+
+```
+
+loss.py 中的关键部分:
+
+```python
+def forward(self, features, labels=None, mask=None):
+    # features: [batch_size, hidden_dim] 每个样本的表示向量
+    # labels: [batch_size] 每个样本的类别
+    
+    # 1. 构建 mask：同类为 1，异类为 0
+    labels = labels.view(-1, 1)
+    mask = torch.eq(labels, labels.T).float()  # [batch, batch]
+    # mask[i][j] = 1 如果样本 i 和 j 同类
+    
+    # 2. 计算所有样本两两之间的相似度
+    anchor_dot_contrast = torch.matmul(features, features.T) / self.temperature
+    # [batch, batch] 的相似度矩阵
+    
+    # 3. 去掉自己和自己的相似度（对角线）
+    logits_mask = 1 - torch.eye(batch_size)
+    
+    # 4. 计算 softmax 分母（所有非自身样本）
+    exp_logits = torch.exp(anchor_dot_contrast) * logits_mask
+    log_prob = anchor_dot_contrast - torch.log(exp_logits.sum(1, keepdim=True))
+    
+    # 5. 只取正样本的 log_prob，求平均
+    mean_log_prob_pos = (mask * log_prob).sum(1) / mask.sum(1)
+    
+    # 6. 最终 loss
+    loss = -mean_log_prob_pos.mean()
+```
+
+&nbsp;
+
+&nbsp;
+
+## kaggle平台上运行与测评的结果
+
+|  | imdb_modernbert_unsloth.py | imdb_bert_rdrop.py | imdb_bert_scl_trainer.py |
+|-----|-----|-----|-----|
+| Score | \ | 0.93604 | 0.91660 |
+
+&nbsp;
+
+### kaggle上的版本
+
+1. https://www.kaggle.com/code/ruiluu/imdb-modernbert-unsloth
+
+2. https://www.kaggle.com/code/ruiluu/imdb-bert-rdrop
+
+3. https://www.kaggle.com/code/ruiluu/imdb-bert-scl-trainer
